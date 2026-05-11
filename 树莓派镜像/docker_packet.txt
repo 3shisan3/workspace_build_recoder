@@ -1,0 +1,66 @@
+# 1. 拉取官方 ARM64 Debian 镜像
+docker pull --platform linux/arm64 arm64v8/debian:bookworm
+
+# 2. 创建并进入容器
+docker run --platform linux/arm64 -it --name rpi_builder arm64v8/debian:bookworm bash
+
+# === 以下命令在容器内执行 ===
+
+# 3. 更新软件源
+apt-get update
+
+# 4. 安装编译工具
+apt-get install -y build-essential git cmake
+
+# 5. 安装 Qt5 及相关组件（关键修改）
+# Debian Bookworm 默认仓库包含 Qt5，使用以下命令安装完整开发环境
+apt-get install -y qtbase5-dev qtbase5-dev-tools \
+    qttools5-dev qttools5-dev-tools qtdeclarative5-dev \
+    libqt5core5a libqt5gui5 libqt5widgets5
+# 多媒体模块
+apt-get install -y qtmultimedia5-dev libqt5multimedia5 libqt5multimedia5-plugins libqt5multimediawidgets5 qtmultimedia5-examples
+# 位置模块
+apt-get install -y qtpositioning5-dev libqt5positioning5 libqt5positioning5-plugins
+
+# 如果需要 Qt5 的附加模块（根据项目需求可选）
+# apt-get install -y qtmultimedia5-dev libqt5svg5-dev qtconnectivity5-dev
+
+# 6. 验证安装
+qmake --version
+
+# 7. 测试编译（可选，确认环境正常）
+# 创建一个简单测试项目
+mkdir /tmp/test_qt && cd /tmp/test_qt
+echo -e "#include <QApplication>\n#include <QLabel>\nint main(int argc, char *argv[]) {\n    QApplication app(argc, argv);\n    QLabel label(\"Hello Qt5 on Docker!\");\n    label.show();\n    return app.exec();\n}" > main.cpp
+qmake -project
+qmake
+make
+# 如果编译成功，说明 Qt5 环境完全正常
+
+# 8. 退出容器
+exit
+
+# === 回到 Windows PowerShell ===
+
+# 9. 保存为新的镜像
+docker commit rpi_builder rpi-qt-builder:qt5
+
+# 10. 导出为文件（可选，用于分享）
+docker save -o D:\rpi-qt-builder-qt5.tar rpi-qt-builder:qt5
+
+
+#额外安装
+安装 VNC 服务器和必要组件
+apt-get install -y tightvncserver x11-utils xauth xfonts-base
+安装轻量级窗口管理器（可选，用于管理窗口）
+apt-get install -y openbox
+设置 VNC 密码（首次运行需要设置）
+vncpasswd
+输入密码（例如：123456），用于客户端连接
+启动 VNC 服务器（分辨率可调整）
+vncserver :1 -geometry 1280x720 -depth 24
+设置 DISPLAY 环境变量
+export DISPLAY=:1
+
+安装 X11 相关库
+apt-get install -y libx11-6 libxcb1 libxext6 libxrender1

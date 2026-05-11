@@ -1,0 +1,41 @@
+1、官网下载
+
+2、"Docker Desktop Installer.exe" install --installation-dir="D:\Docker\Docker" --windows-containers-default-data-root="D:\Docker\Windows" --wsl-default-data-root="D:\WSL"
+ 
+命令解释：
+https://docs.docker.com/desktop/setup/install/windows-install/#install-from-the-command-line
+
+installation-dir 安装目录
+wsl-default-data-root wsl分发目录（磁盘存储位置）
+
+3、中文配置
+https://github.com/asxez/DockerDesktop-CN
+
+4、分享镜像导入
+docker load -i D:\rpi-qt-builder-qt5.tar
+注释：目前镜像内已搭建支持vnc和x11两种方式映射到外部显示，具体windows侧准备自行搜索
+vnc密码123456
+启动 VNC 服务器（分辨率可调整）
+vncserver :1 -geometry 1280x720 -depth 24
+设置 DISPLAY 环境变量
+export DISPLAY=:1
+
+5、进入命令行编译环境
+docker run --platform linux/arm64 -it --rm `
+  -e DISPLAY=host.docker.internal:0 `
+ -p 2222:22 `
+ -p 5901:5901 `
+  -v D:\test:/workspace `
+  -e QT_X11_NO_MITSHM=1 `
+  rpi-qt-builder:qt5 bash
+
+注意：host.docker.internal 是Docker提供的特殊DNS名称，指向宿主机（你的Windows）
+--platform linux/arm64：模拟 ARM64 环境
+-e DISPLAY=host.docker.internal:0：将图形输出指向 Windows 宿主机（需配合 X11 服务）
+-v D:\hello_qt:/workspace：将 Windows 目录挂载到容器的 /workspace
+-e QT_X11_NO_MITSHM=1：避免共享内存问题
+
+-p 2222:22：将宿主机的 2222 端口映射到容器的 22 端口（SSH 服务默认端口）
+-p 5901:5901：将宿主机的 5901 端口映射到容器的 5901 端口（VNC 服务器默认从 5900+N 开始，vncserver :1对应 5901 端口）
+
+挂载路径不同命令行终端分隔符之类会有所不同，需注意区分
