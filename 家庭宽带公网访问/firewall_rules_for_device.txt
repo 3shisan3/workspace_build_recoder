@@ -1,0 +1,619 @@
+#!/bin/sh
+# 阿里云IPv6 DDNS防火墙规则管理脚本 - 端口配置版
+# 基于MAC地址和端口配置动态更新防火墙规则
+
+# ========== 主配置 ==========
+# 配置文件格式: 设备描述|MAC地址|端口列表(逗号分隔)
+CONFIG_FILE="/jffs/scripts/firewall_devices.conf"
+# 防火墙规则标记
+RULE_TAG="ALIDDNS_FW"
+# 防火墙规则缓存目录
+FW_CACHE_DIR="/tmp/firewall_cache"
+# 日志文件
+FW_LOG="/tmp/firewall_devices.log"
+# 日志级别: info, warn, error, debug
+LOG_LEVEL="info"
+# ===========================
+
+# 日志函数
+log_fw() {
+    local level="$1"
+    local msg="$2"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    
+    # 日志级别过滤
+    case "$LOG_LEVEL" in
+        "debug") echo_enabled=true ;;
+        "info") [[ "$level" =~ ^(info|warn|error)$ ]] && echo_enabled=true ;;
+        "warn") [[ "$level" =~ ^(warn|error)$ ]] && echo_enabled=true ;;
+        "error") [[ "$level" = "error" ]] && echo_enabled=true ;;
+        *) echo_enabled=true ;;
+    esac
+    
+    if [ "$echo_enabled" = "true" ]; then
+        echo "[$timestamp] [$level] $msg" >> "$FW_LOG"
+        
+        # 重要日志也输出到控制台
+        if [[ "$level" =~ ^(warn|error)$ ]] || [[ "$msg" =~ (开始|结束|成功|失败|错误|更新|变化) ]]; then
+            echo "$msg"
+        fi
+    fi
+}
+
+# 初始化
+init_firewall() {
+    mkdir -p "$FW_CACHE_DIR"
+    touch "$FW_LOG"
+    
+    # 限制日志大小
+    if [ -f "$FW_LOG" ] && [ $(wc -l < "$FW_LOG" 2>/dev/null) -gt 500 ]; then
+        log_fw "info" "清理旧日志..."
+        tail -n 200 "$FW_LOG" > "${FW_LOG}.tmp" 2>/dev/null
+        [ -f "${FW_LOG}.tmp" ] && mv "${FW_LOG}.tmp" "$FW_LOG"
+    fi
+}
+
+# 获取设备IPv6地址
+get_device_ipv6() {
+    local mac="$1"
+    local current_ip=""
+    
+    if [ -z "$mac" ]; then
+        # 路由器自身
+        current_ip=$(nvram get ipv6_rtr_addr 2>/dev/null | awk '{print $1}')
+        if [ -z "$current_ip" ]; then
+            current_ip=$(ifconfig $(nvram get wan0_ifname) 2>/dev/null | grep -oE 'inet6 addr: (2409[0-9a-f:]+)' | head -1 | awk '{print $2}')
+        fi
+        if [ -z "$current_ip" ]; then
+            current_ip=$(ip -6 addr show dev $(nvram get wan0_ifname) 2>/dev/null | grep '2409' | grep global | head -1 | awk '{print $2}' | cut -d'/' -f1)
+        fi
+    else
+        # 内网设备
+        # 方法1: 从ARP表中获取
+        current_ip=$(ip -6 neigh show 2>/dev/null | grep -i "$mac" | awk '{print $1}' | head -1)
+        
+        # 方法2: 从DHCP租约中获取
+        if [ -z "$current_ip" ] && [ -f "/var/lib/misc/dnsmasq.leases" ]; then
+            current_ip=$(grep -i "$mac" /var/lib/misc/dnsmasq.leases 2>/dev/null | awk '{print $3}' | head -1)
+        fi
+        
+        # 方法3: 从网络扫描中获取
+        if [ -z "$current_ip" ]; then
+            # 尝试ping6所有设备来更新ARP表
+            ping6 -c 1 -W 1 ff02::1%br0 >/dev/null 2>&1
+            sleep 1
+            current_ip=$(ip -6 neigh show 2>/dev/null | grep -i "$mac" | awk '{print $1}' | head -1)
+        fi
+    fi
+    
+    # 验证IPv6地址格式
+    if [ -n "$current_ip" ]; then
+        if [[ "$current_ip" =~ ^[0-9a-fA-F:]+$ ]]; then
+            echo "$current_ip"
+            return 0
+        else
+            log_fw "warn" "获取到无效的IPv6地址格式: $current_ip"
+            return 1
+        fi
+    fi
+    
+    return 1
+}
+
+# 检查IP是否变化
+check_ip_changed() {
+    local mac="$1"
+    local current_ip="$2"
+    local cache_file="$FW_CACHE_DIR/${mac//:/_}.ipcache"
+    
+    if [ ! -f "$cache_file" ]; then
+        # 缓存文件不存在，记录新IP
+        echo "$current_ip" > "$cache_file"
+        log_fw "debug" "首次记录MAC $mac 的IP: $current_ip"
+        return 0  # 返回0表示有变化（首次运行）
+    fi
+    
+    local last_ip=$(cat "$cache_file" 2>/dev/null | head -1)
+    
+    if [ -z "$last_ip" ]; then
+        echo "$current_ip" > "$cache_file"
+        log_fw "debug" "缓存为空，记录MAC $mac 的IP: $current_ip"
+        return 0
+    fi
+    
+    if [ "$current_ip" = "$last_ip" ]; then
+        log_fw "debug" "MAC $mac 的IP未变化: $current_ip"
+        return 1  # 返回1表示无变化
+    else
+        log_fw "info" "🔄 MAC $mac 的IP地址变化: $last_ip -> $current_ip"
+        echo "$current_ip" > "$cache_file"
+        return 0  # 返回0表示有变化
+    fi
+}
+
+# 清理旧的防火墙规则
+clean_device_fw_rules() {
+    local mac="$1"
+    
+    if [ -z "$mac" ]; then
+        log_fw "warn" "清理规则失败: MAC地址为空"
+        return 1
+    fi
+    
+    local mac_simple=$(echo "$mac" | tr -d ':')
+    local removed=0
+    
+    # 清理INPUT链中的规则
+    for chain in INPUT FORWARD; do
+        # 获取规则行号（倒序删除）
+        ip6tables -L "$chain" -n --line-numbers 2>/dev/null | \
+            grep -E "MAC_${mac_simple}" | \
+            awk '{print $1}' | \
+            sort -rn | \
+            while read rule_num; do
+                if ip6tables -D "$chain" "$rule_num" 2>/dev/null; then
+                    log_fw "debug" "删除 $chain 链规则 #$rule_num (MAC: $mac)"
+                    removed=$((removed + 1))
+                fi
+            done
+    done
+    
+    if [ "$removed" -gt 0 ]; then
+        log_fw "info" "清理了MAC $mac 的 $removed 条防火墙规则"
+    fi
+    
+    return 0
+}
+
+# 为设备添加防火墙规则
+add_fw_rules_for_device() {
+    local description="$1"
+    local mac="$2"
+    local ports="$3"
+    local ipv6="$4"
+    
+    if [ -z "$ipv6" ]; then
+        log_fw "warn" "跳过 $description: 无有效的IPv6地址"
+        return 1
+    fi
+    
+    if [ -z "$ports" ]; then
+        log_fw "warn" "跳过 $description: 未配置端口"
+        return 1
+    fi
+    
+    local mac_simple=$(echo "$mac" | tr -d ':')
+    log_fw "info" "为 $description (MAC: $mac) 添加防火墙规则"
+    log_fw "info" "  IPv6地址: $ipv6"
+    log_fw "info" "  开放端口: $ports"
+    
+    # 先清理该设备的所有旧规则
+    clean_device_fw_rules "$mac"
+    
+    # 处理端口列表
+    IFS=',' read -ra port_array <<< "$ports"
+    
+    # 添加INPUT链规则
+    for port_str in "${port_array[@]}"; do
+        # 清理端口字符串
+        port_str=$(echo "$port_str" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        
+        # 检查端口范围格式 (如 1000-2000)
+        if [[ "$port_str" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            local start_port="${BASH_REMATCH[1]}"
+            local end_port="${BASH_REMATCH[2]}"
+            
+            # 验证端口范围有效性
+            if [ "$start_port" -le "$end_port" ] && [ "$start_port" -ge 1 ] && [ "$end_port" -le 65535 ]; then
+                # 添加TCP端口范围规则
+                ip6tables -I INPUT 1 -d "$ipv6" -p tcp --dport "${start_port}:${end_port}" -j ACCEPT \
+                    -m comment --comment "ALIDDNS_FW_MAC_${mac_simple}_TCP_${start_port}-${end_port}"
+                log_fw "debug" "  允许TCP端口范围: ${start_port}-${end_port}"
+                
+                # 如果需要UDP，取消下面这行的注释
+                # ip6tables -I INPUT 1 -d "$ipv6" -p udp --dport "${start_port}:${end_port}" -j ACCEPT \
+                #     -m comment --comment "ALIDDNS_FW_MAC_${mac_simple}_UDP_${start_port}-${end_port}"
+            else
+                log_fw "warn" "  无效的端口范围: $port_str (必须为1-65535，且起始端口<=结束端口)"
+            fi
+            
+        elif [[ "$port_str" =~ ^[0-9]+$ ]]; then
+            # 单个端口
+            local port_num="$port_str"
+            
+            # 验证端口号有效性
+            if [ "$port_num" -ge 1 ] && [ "$port_num" -le 65535 ]; then
+                # 添加TCP端口规则
+                ip6tables -I INPUT 1 -d "$ipv6" -p tcp --dport "$port_num" -j ACCEPT \
+                    -m comment --comment "ALIDDNS_FW_MAC_${mac_simple}_TCP_$port_num"
+                log_fw "debug" "  允许TCP端口: $port_num"
+                
+                # 如果需要UDP，取消下面这行的注释
+                # ip6tables -I INPUT 1 -d "$ipv6" -p udp --dport "$port_num" -j ACCEPT \
+                #     -m comment --comment "ALIDDNS_FW_MAC_${mac_simple}_UDP_$port_num"
+            else
+                log_fw "warn" "  无效的端口号: $port_str (必须为1-65535)"
+            fi
+        else
+            log_fw "warn" "  跳过无效端口格式: $port_str (应为数字或数字-数字格式)"
+        fi
+    done
+    
+    # 允许ICMPv6（ping等）
+    ip6tables -I INPUT 1 -d "$ipv6" -p ipv6-icmp -j ACCEPT \
+        -m comment --comment "ALIDDNS_FW_MAC_${mac_simple}_ICMP"
+    log_fw "debug" "  允许ICMPv6"
+    
+    # 允许已建立的连接和相关连接
+    ip6tables -I INPUT 1 -d "$ipv6" -m state --state ESTABLISHED,RELATED -j ACCEPT \
+        -m comment --comment "ALIDDNS_FW_MAC_${mac_simple}_EST"
+    
+    log_fw "info" "✅ $description 防火墙规则已添加"
+    return 0
+}
+
+# 解析配置行
+parse_config_line() {
+    local line="$1"
+    
+    # 使用 | 分割字段
+    IFS='|' read -r description mac ports <<< "$line"
+    
+    # 清理空格
+    description=$(echo "$description" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    mac=$(echo "$mac" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    ports=$(echo "$ports" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    
+    # 验证MAC地址格式（可为空，表示路由器自身）
+    if [ -n "$mac" ] && ! [[ "$mac" =~ ^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$ ]]; then
+        log_fw "warn" "无效的MAC地址格式: $mac"
+        mac=""
+    fi
+    
+    # 验证端口格式
+    if [ -n "$ports" ]; then
+        # 检查端口格式：数字或数字-数字
+        local valid_ports=true
+        IFS=',' read -ra port_array <<< "$ports"
+        for port in "${port_array[@]}"; do
+            port=$(echo "$port" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            if ! [[ "$port" =~ ^[0-9]+(-[0-9]+)?$ ]]; then
+                log_fw "warn" "无效的端口格式: $port"
+                valid_ports=false
+            fi
+        done
+        [ "$valid_ports" = "false" ] && ports=""
+    fi
+    
+    echo "$description|$mac|$ports"
+}
+
+# 处理单个设备
+process_single_device() {
+    local description="$1"
+    local mac="$2"
+    local ports="$3"
+    
+    log_fw "info" "处理设备: $description"
+    log_fw "debug" "  MAC地址: ${mac:-路由器自身}"
+    log_fw "debug" "  配置端口: $ports"
+    
+    # 获取设备IPv6地址
+    local current_ip=$(get_device_ipv6 "$mac")
+    
+    if [ -z "$current_ip" ]; then
+        log_fw "warn" "⚠️ 无法获取 $description 的IPv6地址"
+        return 1
+    fi
+    
+    log_fw "debug" "  当前IPv6: $current_ip"
+    
+    # 检查IP是否变化
+    if ! check_ip_changed "$mac" "$current_ip"; then
+        log_fw "debug" "  IP未变化，跳过防火墙更新"
+        return 0
+    fi
+    
+    # IP有变化，更新防火墙规则
+    log_fw "info" "🔄 $description 的IP地址已变化，更新防火墙规则"
+    
+    if add_fw_rules_for_device "$description" "$mac" "$ports" "$current_ip"; then
+        log_fw "info" "✅ $description 防火墙规则更新完成"
+        return 0
+    else
+        log_fw "error" "❌ $description 防火墙规则更新失败"
+        return 1
+    fi
+}
+
+# 主处理函数
+process_firewall_rules() {
+    init_firewall
+    log_fw "info" "===== 开始检查防火墙规则 ====="
+    
+    # 检查配置文件
+    if [ ! -f "$CONFIG_FILE" ]; then
+        log_fw "error" "❌ 配置文件不存在: $CONFIG_FILE"
+        log_fw "info" "请创建配置文件，格式: 设备描述|MAC地址|端口列表"
+        log_fw "info" "示例: 主路由器||22,80,443"
+        log_fw "info" "示例: 我的电脑|00:11:22:33:44:55|8080,9000-9010"
+        return 1
+    fi
+    
+    local success_count=0
+    local fail_count=0
+    local skip_count=0
+    
+    # 读取配置文件
+    while IFS= read -r raw_line; do
+        # 跳过注释和空行
+        [ -z "$raw_line" ] && continue
+        [[ "$raw_line" =~ ^[[:space:]]*# ]] && continue
+        
+        # 解析配置行
+        parsed=$(parse_config_line "$raw_line")
+        IFS='|' read -r description mac ports <<< "$parsed"
+        
+        if [ -z "$description" ] || [ -z "$ports" ]; then
+            log_fw "warn" "⚠️ 跳过无效配置行: $raw_line"
+            continue
+        fi
+        
+        # 处理设备
+        if process_single_device "$description" "$mac" "$ports"; then
+            success_count=$((success_count + 1))
+        elif [ $? -eq 1 ]; then
+            # IP获取失败
+            fail_count=$((fail_count + 1))
+        else
+            # IP未变化
+            skip_count=$((skip_count + 1))
+        fi
+        
+        # 短暂延迟避免系统负载
+        sleep 1
+    done < "$CONFIG_FILE"
+    
+    log_fw "info" "===== 防火墙规则检查完成 ====="
+    log_fw "info" "✅ 成功更新: $success_count 个设备"
+    log_fw "info" "⏭️  跳过(IP未变): $skip_count 个设备"
+    [ "$fail_count" -gt 0 ] && log_fw "info" "❌ 失败: $fail_count 个设备"
+    
+    return 0
+}
+
+# 显示当前防火墙规则状态
+show_fw_status() {
+    echo ""
+    echo "=== 当前防火墙规则状态 ==="
+    echo ""
+    
+    echo "INPUT链规则 (ALIDDNS_FW标记):"
+    echo "------------------------------"
+    ip6tables -L INPUT -n --line-numbers 2>/dev/null | grep "ALIDDNS_FW" | head -30
+    
+    echo ""
+    echo "FORWARD链规则 (ALIDDNS_FW标记):"
+    echo "--------------------------------"
+    ip6tables -L FORWARD -n --line-numbers 2>/dev/null | grep "ALIDDNS_FW" | head -30
+    
+    echo ""
+    echo "IP地址缓存状态:"
+    echo "----------------"
+    if [ -d "$FW_CACHE_DIR" ] && [ -n "$(ls -A "$FW_CACHE_DIR"/*.ipcache 2>/dev/null)" ]; then
+        for cache_file in "$FW_CACHE_DIR"/*.ipcache; do
+            local mac=$(basename "$cache_file" .ipcache | tr '_' ':')
+            local ip=$(cat "$cache_file" 2>/dev/null | head -1)
+            echo "  $(printf "%-20s" "$mac"): $ip"
+        done
+    else
+        echo "  无缓存记录"
+    fi
+    
+    echo ""
+    echo "配置文件设备列表:"
+    echo "------------------"
+    if [ -f "$CONFIG_FILE" ]; then
+        local count=0
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            [[ "$line" =~ ^[[:space:]]*# ]] && continue
+            
+            parsed=$(parse_config_line "$line")
+            IFS='|' read -r description mac ports <<< "$parsed"
+            
+            if [ -n "$description" ] && [ -n "$ports" ]; then
+                count=$((count + 1))
+                if [ -z "$mac" ]; then
+                    echo "  $count. $description (路由器) - 端口: $ports"
+                else
+                    echo "  $count. $description ($mac) - 端口: $ports"
+                fi
+            fi
+        done < "$CONFIG_FILE"
+        
+        if [ "$count" -eq 0 ]; then
+            echo "  无有效设备配置"
+        fi
+    else
+        echo "  配置文件不存在"
+    fi
+}
+
+# 清理所有防火墙规则
+clean_all_fw_rules() {
+    log_fw "info" "清理所有防火墙规则..."
+    
+    local total_removed=0
+    
+    for chain in INPUT FORWARD; do
+        # 获取并倒序删除所有标记的规则
+        while true; do
+            local rule_info=$(ip6tables -L "$chain" -n --line-numbers 2>/dev/null | \
+                grep -m1 "ALIDDNS_FW" | awk '{print $1, $0}')
+            
+            if [ -z "$rule_info" ]; then
+                break
+            fi
+            
+            local rule_num=$(echo "$rule_info" | awk '{print $1}')
+            local rule_desc=$(echo "$rule_info" | cut -d' ' -f2-)
+            
+            if ip6tables -D "$chain" "$rule_num" 2>/dev/null; then
+                log_fw "info" "删除规则: $chain #$rule_num"
+                total_removed=$((total_removed + 1))
+            else
+                log_fw "warn" "删除规则失败: $chain #$rule_num"
+                break
+            fi
+        done
+    done
+    
+    # 清理缓存目录
+    rm -f "$FW_CACHE_DIR"/*.ipcache 2>/dev/null
+    
+    log_fw "info" "✅ 清理完成，共删除 $total_removed 条规则"
+}
+
+# 设置定时任务
+setup_cron() {
+    log_fw "info" "设置定时任务..."
+    
+    # 创建cron任务（每10分钟检查一次）
+    local cron_entry="*/10 * * * * /jffs/scripts/aliddns_firewall.sh update >/dev/null 2>&1"
+    
+    # 检查是否已存在
+    if ! crontab -l 2>/dev/null | grep -q "aliddns_firewall.sh"; then
+        (crontab -l 2>/dev/null; echo "$cron_entry") | crontab -
+        log_fw "info" "✅ 定时任务已添加 (每10分钟运行一次)"
+    else
+        log_fw "info" "ℹ️ 定时任务已存在"
+    fi
+    
+    # 添加开机启动
+    if [ -f "/jffs/scripts/firewall-start" ] && ! grep -q "aliddns_firewall.sh" /jffs/scripts/firewall-start; then
+        echo "/jffs/scripts/aliddns_firewall.sh update" >> /jffs/scripts/firewall-start
+        chmod +x /jffs/scripts/firewall-start
+        log_fw "info" "✅ 已添加到 firewall-start 开机启动"
+    fi
+    
+    # 添加服务启动脚本
+    if [ -f "/jffs/scripts/services-start" ] && ! grep -q "aliddns_firewall.sh" /jffs/scripts/services-start; then
+        echo "sleep 30 && /jffs/scripts/aliddns_firewall.sh update" >> /jffs/scripts/services-start
+        chmod +x /jffs/scripts/services-start
+        log_fw "info" "✅ 已添加到 services-start 开机启动"
+    fi
+}
+
+# 创建配置文件示例
+create_config_example() {
+    cat > "$CONFIG_FILE.example" << 'EOF'
+# 阿里云DDNS防火墙配置文件
+# 格式: 设备描述|MAC地址|端口列表
+# 注意: 
+# 1. MAC地址必须大写，用冒号分隔，路由器自身MAC地址留空
+# 2. 端口可以是单个端口(如 80)或端口范围(如 1000-2000)
+# 3. 多个端口用逗号分隔
+# 4. 以#开头的行是注释
+
+# 路由器自身 (MAC地址留空表示路由器)
+主路由器||22,80,443,8080
+
+# 内网设备
+我的电脑|00:11:22:33:44:55|3389,8080,9000-9010
+NAS设备|AA:BB:CC:DD:EE:FF|22,80,443,5000-5010
+手机|11:22:33:44:55:66|9999
+游戏主机|66:77:88:99:AA:BB|3074,3075,3076
+
+# 示例结束
+EOF
+    
+    log_fw "info" "✅ 配置文件示例已创建: $CONFIG_FILE.example"
+    log_fw "info" "请复制示例文件并修改: cp $CONFIG_FILE.example $CONFIG_FILE"
+}
+
+# 工具函数
+case "${1:-}" in
+    "update")
+        process_firewall_rules
+        ;;
+    "status")
+        show_fw_status
+        ;;
+    "setup")
+        setup_cron
+        ;;
+    "clean")
+        clean_all_fw_rules
+        ;;
+    "test")
+        if [ -n "$2" ]; then
+            # 测试指定MAC地址的设备
+            if [ -f "$CONFIG_FILE" ]; then
+                while IFS= read -r line; do
+                    [ -z "$line" ] && continue
+                    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+                    
+                    parsed=$(parse_config_line "$line")
+                    IFS='|' read -r description mac ports <<< "$parsed"
+                    
+                    if [ -n "$mac" ] && [ "$mac" = "$2" ]; then
+                        echo "测试设备: $description (MAC: $mac)"
+                        process_single_device "$description" "$mac" "$ports"
+                        exit 0
+                    fi
+                done < "$CONFIG_FILE"
+                echo "未找到MAC地址: $2"
+            else
+                echo "配置文件不存在"
+            fi
+        else
+            echo "使用方法: $0 test <MAC地址>"
+            echo "示例: $0 test 00:11:22:33:44:55"
+        fi
+        ;;
+    "config")
+        if [ -f "$CONFIG_FILE" ]; then
+            cat "$CONFIG_FILE"
+        else
+            echo "配置文件不存在"
+            echo "运行 '$0 example' 创建示例配置文件"
+        fi
+        ;;
+    "example")
+        create_config_example
+        ;;
+    "log")
+        if [ -f "$FW_LOG" ]; then
+            tail -50 "$FW_LOG"
+        else
+            echo "日志文件不存在"
+        fi
+        ;;
+    "help"|"--help"|"-h")
+        echo "阿里云DDNS防火墙规则管理脚本"
+        echo ""
+        echo "使用方法: $0 [命令]"
+        echo ""
+        echo "命令:"
+        echo "  update      更新所有设备的防火墙规则（仅在IP变化时更新）"
+        echo "  status      显示当前防火墙规则状态"
+        echo "  setup       设置定时任务和开机启动"
+        echo "  clean       清理所有脚本创建的防火墙规则"
+        echo "  test <MAC>  测试指定MAC地址的防火墙规则"
+        echo "  config      显示当前配置文件"
+        echo "  example     创建配置文件示例"
+        echo "  log         查看最近日志"
+        echo "  help        显示此帮助信息"
+        echo ""
+        echo "无参数运行: 同update命令"
+        echo ""
+        echo "配置文件: $CONFIG_FILE"
+        echo "格式: 设备描述|MAC地址|端口列表"
+        echo "示例: 主路由器||22,80,443"
+        echo "示例: 我的电脑|00:11:22:33:44:55|8080,9000-9010"
+        ;;
+    *)
+        process_firewall_rules
+        ;;
+esac

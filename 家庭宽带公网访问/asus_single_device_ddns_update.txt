@@ -1,0 +1,218 @@
+#!/bin/sh
+# 阿里云 IPv6 DDNS 智能版 - 精简日志版
+# 特点：只记录关键信息，IP未变化不记录日志，避免日志无限增长
+
+# ========== 配置部分 ==========
+AccessKeyId=""
+AccessKeySecret=""
+DomainName=""    # 修改为你的主域名
+SubDomain=""          # 修改为你的子域名
+# =============================
+
+# 日志和缓存设置
+LOG_FILE="/tmp/aliddns.log"
+IP_CACHE="/tmp/aliddns_ip_cache"
+LAST_IP=""
+
+# 精简日志函数
+log() {
+    local msg="$1"
+    # 只记录关键信息
+    case "$msg" in
+        *❌*|*错误*|*失败*|*✅*|*成功*|*🔄*|*变化*|*创建*|*更新*|*开始*|*结束*|*调试*|*查询*|*找到*|*不存在*)
+            # 限制日志大小（保留最后100行）
+            if [ -f "$LOG_FILE" ]; then
+                local line_count=$(wc -l < "$LOG_FILE" 2>/dev/null | tr -d ' ' || echo 0)
+                if [ "$line_count" -gt 100 ]; then
+                    tail -n 50 "$LOG_FILE" > "${LOG_FILE}.tmp" 2>/dev/null
+                    [ -f "${LOG_FILE}.tmp" ] && mv "${LOG_FILE}.tmp" "$LOG_FILE"
+                fi
+            fi
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - $msg" >> "$LOG_FILE" 2>/dev/null
+            ;;
+    esac
+}
+
+# URL 编码函数
+url_encode() {
+    echo -n "$1" | while IFS= read -r -n1 c; do
+        case $c in
+            [a-zA-Z0-9.~_-]) printf '%c' "$c" ;;
+            *) printf '%%%02X' "'$c" ;;
+        esac
+    done
+}
+
+# 清理旧日志（每周执行一次，这里只是定义函数）
+clean_old_logs() {
+    [ -f "$LOG_FILE" ] && [ $(find "$LOG_FILE" -mtime +7 2>/dev/null | wc -l) -eq 1 ] && rm -f "$LOG_FILE"
+    [ -f "$IP_CACHE" ] && [ $(find "$IP_CACHE" -mtime +1 2>/dev/null | wc -l) -eq 1 ] && rm -f "$IP_CACHE"
+}
+
+# 脚本开始执行
+clean_old_logs
+log "===== DDNS 检查开始 ====="
+
+# 获取 IPv6 地址
+current_ip=$(nvram get ipv6_rtr_addr 2>/dev/null | awk '{print $1}')
+if [ -z "$current_ip" ]; then
+    current_ip=$(ifconfig $(nvram get wan0_ifname) 2>/dev/null | grep -oE 'inet6 addr: (2409[0-9a-f:]+)' | head -1 | awk '{print $2}')
+fi
+
+# 备用获取方法
+if [ -z "$current_ip" ]; then
+    current_ip=$(ip -6 addr show dev $(nvram get wan0_ifname) 2>/dev/null | grep '2409' | grep global | head -1 | awk '{print $2}' | cut -d'/' -f1)
+fi
+
+if [ -z "$current_ip" ]; then
+    log "❌ 错误：无法获取 IPv6 地址"
+    log "调试: 接口=$(nvram get wan0_ifname 2>/dev/null)"
+    exit 1
+fi
+
+# 检查IP是否变化
+if [ -f "$IP_CACHE" ]; then
+    LAST_IP=$(cat "$IP_CACHE" 2>/dev/null)
+    if [ "$current_ip" = "$LAST_IP" ] && [ -n "$LAST_IP" ]; then
+        # IP未变化，不记录日志直接退出
+        exit 0
+    fi
+    log "🔄 IP地址变化: $LAST_IP -> $current_ip"
+else
+    log "📡 首次获取IP: $current_ip"
+fi
+
+log "开始阿里云DNS操作..."
+
+# 生成时间戳和随机数
+timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+nonce=$(head -c 16 /dev/urandom 2>/dev/null | openssl base64 2>/dev/null | tr -d '/+=\n' | head -c 16 2>/dev/null)
+[ -z "$nonce" ] && nonce=$(openssl rand -hex 8 2>/dev/null)
+
+# 1. 查询现有记录
+log "查询阿里云DNS记录..."
+query_params="AccessKeyId=$(url_encode "$AccessKeyId")&Action=$(url_encode "DescribeDomainRecords")&DomainName=$(url_encode "$DomainName")&Format=JSON&RRKeyWord=$(url_encode "$SubDomain")&SignatureMethod=HMAC-SHA1&SignatureNonce=$(url_encode "$nonce")&SignatureVersion=1.0&Timestamp=$(url_encode "$timestamp")&Type=AAAA&Version=2015-01-09"
+
+# 计算查询签名
+query_string_to_sign="GET&%2F&$(url_encode "$query_params")"
+query_signature=$(echo -n "$query_string_to_sign" | openssl sha1 -hmac "${AccessKeySecret}&" -binary 2>/dev/null | openssl base64 2>/dev/null | tr -d '\n')
+encoded_query_signature=$(url_encode "$query_signature")
+
+# 调用查询API
+query_url="https://alidns.aliyuncs.com/?${query_params}&Signature=${encoded_query_signature}"
+query_response=$(curl -s -k --connect-timeout 10 "$query_url" 2>/dev/null)
+
+if [ $? -ne 0 ]; then
+    log "❌ 查询API调用失败"
+    exit 1
+fi
+
+# 解析查询结果
+record_id=""
+existing_ip=""
+action=""
+extra_params=""
+
+if echo "$query_response" | grep -q '"TotalCount"'; then
+    total_count=$(echo "$query_response" | grep -o '"TotalCount":[0-9]*' | cut -d: -f2 2>/dev/null | head -1)
+    
+    if [ -n "$total_count" ] && [ "$total_count" -gt 0 ]; then
+        # 提取现有记录
+        record_id=$(echo "$query_response" | grep -o '"RecordId":"[^"]*"' | head -1 | cut -d'"' -f4 2>/dev/null)
+        existing_ip=$(echo "$query_response" | grep -o '"Value":"[^"]*"' | head -1 | cut -d'"' -f4 2>/dev/null)
+        
+        if [ -n "$record_id" ] && [ -n "$existing_ip" ]; then
+            log "✅ 找到记录: ID=$record_id, IP=$existing_ip"
+            
+            if [ "$existing_ip" = "$current_ip" ]; then
+                log "IP相同，更新缓存后退出"
+                echo "$current_ip" > "$IP_CACHE"
+                exit 0
+            fi
+            
+            # 需要更新
+            log "IP不同，准备更新"
+            action="UpdateDomainRecord"
+            extra_params="RecordId=$(url_encode "$record_id")&RR=$(url_encode "$SubDomain")"
+        else
+            log "❌ 无法解析记录信息"
+            action="AddDomainRecord"
+            extra_params="DomainName=$(url_encode "$DomainName")&RR=$(url_encode "$SubDomain")"
+        fi
+    else
+        # 需要创建
+        log "➕ 记录不存在，创建新记录"
+        action="AddDomainRecord"
+        extra_params="DomainName=$(url_encode "$DomainName")&RR=$(url_encode "$SubDomain")"
+    fi
+else
+    error_code=$(echo "$query_response" | grep -o '"Code":"[^"]*"' | cut -d'"' -f4 2>/dev/null | head -1)
+    error_msg=$(echo "$query_response" | grep -o '"Message":"[^"]*"' | cut -d'"' -f4 2>/dev/null | head -1)
+    
+    if [ -n "$error_code" ]; then
+        log "❌ 查询失败: $error_code - $error_msg"
+    else
+        log "❌ 查询失败: 未知错误"
+    fi
+    exit 1
+fi
+
+# 2. 执行创建/更新操作
+log "执行操作: $action"
+
+# 生成新的时间戳和随机数
+timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+nonce=$(head -c 16 /dev/urandom 2>/dev/null | openssl base64 2>/dev/null | tr -d '/+=\n' | head -c 16 2>/dev/null)
+[ -z "$nonce" ] && nonce=$(openssl rand -hex 8 2>/dev/null)
+
+# 构造参数
+params="AccessKeyId=$(url_encode "$AccessKeyId")&Action=$(url_encode "$action")&Format=JSON&SignatureMethod=HMAC-SHA1&SignatureNonce=$(url_encode "$nonce")&SignatureVersion=1.0&Timestamp=$(url_encode "$timestamp")&Type=AAAA&Value=$(url_encode "$current_ip")&Version=2015-01-09&${extra_params}"
+
+# 计算签名
+string_to_sign="GET&%2F&$(url_encode "$params")"
+signature=$(echo -n "$string_to_sign" | openssl sha1 -hmac "${AccessKeySecret}&" -binary 2>/dev/null | openssl base64 2>/dev/null | tr -d '\n')
+encoded_signature=$(url_encode "$signature")
+
+# 调用API
+api_url="https://alidns.aliyuncs.com/?${params}&Signature=${encoded_signature}"
+response=$(curl -s -k --connect-timeout 10 "$api_url" 2>/dev/null)
+
+if [ $? -eq 0 ]; then
+    if echo "$response" | grep -q '"RecordId"'; then
+        new_record_id=$(echo "$response" | grep -o '"RecordId":"[^"]*"' | cut -d'"' -f4 2>/dev/null | head -1)
+        if [ "$action" = "AddDomainRecord" ]; then
+            log "✅ 记录创建成功! RecordId: $new_record_id"
+        else
+            log "✅ 记录更新成功! RecordId: $new_record_id"
+        fi
+        # 更新缓存
+        echo "$current_ip" > "$IP_CACHE"
+    else
+        error_code=$(echo "$response" | grep -o '"Code":"[^"]*"' | cut -d'"' -f4 2>/dev/null | head -1)
+        error_msg=$(echo "$response" | grep -o '"Message":"[^"]*"' | cut -d'"' -f4 2>/dev/null | head -1)
+        
+        if [ -n "$error_code" ]; then
+            log "❌ 操作失败: $error_code - $error_msg"
+            
+            # 特殊错误处理
+            case "$error_code" in
+                "InvalidAccessKeyId.NotFound")
+                    log "💡 请检查AccessKeyId是否正确"
+                    ;;
+                "SignatureDoesNotMatch")
+                    log "💡 签名错误，请检查AccessKeySecret"
+                    ;;
+                "Domain.NotExist")
+                    log "💡 域名不存在: $DomainName"
+                    ;;
+            esac
+        else
+            log "❌ 操作失败: 未知响应 - $response"
+        fi
+    fi
+else
+    log "❌ API调用失败"
+fi
+
+log "===== DDNS 检查结束 ====="
+exit 0
