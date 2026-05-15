@@ -1,0 +1,28 @@
+qt 在线安装程序按需添加卸载组件
+默认在线库没有的版本：添加资料档案库
+举例：
+https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/qt5_51210_src_doc_examples/
+https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/qt5_51210/
+https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/qt5_51210_wasm/
+https://download.qt.io/online/qtsdkrepository/windows_x86/desktop/tools_mingw/
+
+http://mirrors.ustc.edu.cn/qtproject/online/qtsdkrepository/windows_x86/root/qt/
+
+中国科学技术大学：http://mirrors.ustc.edu.cn/qtproject/
+清华大学：https://mirrors.tuna.tsinghua.edu.cn/qt/
+北京理工大学：http://mirror.bit.edu.cn/qtproject/
+中国互联网络信息中心：https://mirrors.cnnic.cn/qt/
+找到其下具有Updates.xml的文件内容
+
+离线安装存在安装后不再具备后续添加卸载组件能力。
+注意：部分版本资料档案库国内镜像地址无法正常下载，网络可达依旧推荐直接用官方源
+
+
+msvc只依赖生成工具
+https://aka.ms/vs/stable/vs_BuildTools.exe
+自行勾选，windows sdk最新即可不影响旧版本，生成工具版本，勾选后扫描出来可能只有最新一版，可在cmake中手动设置修改版本
+
+mingw相关环境
+windows使用msys2正常pacman管理安装
+
+上文所有内容vscode + cmake插件扫描使用
