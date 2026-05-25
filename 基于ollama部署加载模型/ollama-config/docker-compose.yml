@@ -1,0 +1,64 @@
+services:
+  ollama:
+    # 使用官方的Ollama镜像
+    image: ollama/ollama:latest
+    container_name: deepseek-ollama
+    restart: unless-stopped
+    
+    # 开启GPU支持
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all # 你可以指定使用哪张卡，或者用 'all'
+              capabilities: [gpu]
+    
+    # 暴露API端口，network_mode: "host"和 ports映射，这两者是互斥
+    ports:
+      - "11434:11434"
+    
+    networks:
+      - ai-network
+    
+    # 将Windows目录映射进容器，这样文件就都存储在Windows下了
+    volumes:
+      # 把Windows下的 D:\Docker\ai-models\ollama-data 映射为容器内的模型存储目录
+      - /mnt/d/Docker/ai-models/ollama-data:/root/.ollama
+      # 可选：映射一个配置目录
+      # - /mnt/d/Docker/ai-models/ollama-config:/root/.ollama/config
+    
+    environment:
+      # 设置国内镜像站，解决模型下载卡住
+      - OLLAMA_ORIGINS=*
+      - OLLAMA_HOST=0.0.0.0
+      # 可选：禁止Ollama自动更新，保持环境一致性
+      - OLLAMA_NOPRUNE=true
+
+    # 指定DNS服务器
+    dns:
+      - 8.8.8.8
+      - 114.114.114.114
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      # 将容器的8080端口映射到你电脑的3000端口
+      # 之后在浏览器访问 localhost:3000 即可
+      - "3000:8080"
+    networks:
+      - ai-network
+    # 关键环境变量：告诉 Open WebUI 去哪里找 Ollama 服务
+    # 这里直接用了上面定义的服务名 'ollama'，容器名应该也可以 和它的内部端口 11434
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+    volumes:
+      # 这是一个 Docker 管理的卷，用来保存你的聊天记录和设置
+      - /mnt/d/Docker/ai-models/open-webui-data:/app/backend/data
+
+networks:
+  ai-network:
+    # 设置容器内的网络为host模式，能获取更好的网络性能
+    driver: bridge
