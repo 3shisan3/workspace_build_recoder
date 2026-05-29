@@ -4,11 +4,10 @@ set -e
 
 # Parse command line arguments
 TARGET="$1"        # Optional target parameter (stable|latest|VERSION)
-INSTALL_PATH="$2"  # Optional install path parameter
 
 # Validate target if provided
 if [[ -n "$TARGET" ]] && [[ ! "$TARGET" =~ ^(stable|latest|[0-9]+\.[0-9]+\.[0-9]+(-[^[:space:]]+)?)$ ]]; then
-    echo "Usage: $0 [stable|latest|VERSION] [INSTALL_PATH]" >&2
+    echo "Usage: $0 [stable|latest|VERSION]" >&2
     exit 1
 fi
 
@@ -156,18 +155,10 @@ chmod +x "$binary_path"
 
 # Run claude install to set up launcher and shell integration
 echo "Setting up Claude Code..."
-if [ -n "$INSTALL_PATH" ]; then
-    echo "Installing to: $INSTALL_PATH"
-    "$binary_path" install --install-path "$INSTALL_PATH" ${TARGET:+"$TARGET"}
-else
-    "$binary_path" install ${TARGET:+"$TARGET"}
-fi
+"$binary_path" install ${TARGET:+"$TARGET"}
 
 # Clean up downloaded file
 rm -f "$binary_path"
 
 echo ""
 echo "✓ Installation complete!"
-if [ -n "$INSTALL_PATH" ]; then
-    echo "Claude Code installed at: $INSTALL_PATH"
-fi

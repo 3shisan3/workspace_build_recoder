@@ -14,29 +14,10 @@ curl -fsSL https://claude.ai/install.sh | bash
 Homebrew，macOS / Linux 安装命令：
 brew install --cask claude-code
 
-其中 https://claude.ai/install.cmd 的可直接使用win_install.cmd文件中的命令，或者直接复制上面的命令到终端中运行
-win_install.cmd 修改原本的install.cmd，支持额外的指定安装路径参数。
-使用方法：
-    # 默认安装到 %USERPROFILE%\.claude
-    win_install.cmd latest
-    # 安装到指定目录（使用 --install-dir）
-    win_install.cmd latest --install-dir "D:\Tools\ClaudeCode"
-    # 使用简写参数 -d
-    win_install.cmd stable -d "C:\Program Files\Claude Code"
-    # 安装特定版本到指定目录
-    win_install.cmd 1.0.58 --install-dir "E:\MyApps\Claude"
-同理 https://claude.ai/install.sh 可替换使用linux_install.sh文件中的命令
-使用方法：
-    # 安装最新版本到默认路径
-    ./linux_install.sh
-    # 安装特定版本到默认路径
-    ./linux_install.sh 1.0.5
-    # 安装最新版本到自定义路径
-    ./linux_install.sh latest /opt/claude-code
-    # 安装特定版本到自定义路径
-    ./linux_install.sh 1.0.5 /usr/local/claude
-    # 安装稳定版到自定义路径
-    ./linux_install.sh stable /home/user/apps/claude
+官方安装脚本确认 —— claude install命令不接受任何安装路径参数
+如果官方安装链接不可用，可使用本地脚本替代：
+    Windows CMD：运行 win_install.cmd [stable|latest|VERSION]
+    macOS / Linux：运行 ./linux_install.sh [stable|latest|VERSION]
 
 windows下Claude 可执行文件所在的目录需要加入系统 PATH，否则 PowerShell 目前无法识别 claude 命令。
 参考路径：

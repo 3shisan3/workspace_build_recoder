@@ -4,38 +4,16 @@ setlocal enabledelayedexpansion
 REM Claude Code Windows CMD Bootstrap Script
 REM Installs Claude Code for environments where PowerShell is not available
 
-REM Parse command line arguments (支持 --install-dir 参数)
+REM Parse command line arguments
 set "TARGET=latest"
-set "INSTALL_DIR="
-set "SKIP_NEXT=0"
 
 :parse_args
 if "%~1"=="" goto :args_done
-if "%SKIP_NEXT%"=="1" (
-    set "SKIP_NEXT=0"
-    shift
-    goto :parse_args
-)
-if /i "%~1"=="--install-dir" (
-    set "INSTALL_DIR=%~2"
-    set "SKIP_NEXT=1"
-    shift
-    shift
-    goto :parse_args
-)
-if /i "%~1"=="-d" (
-    set "INSTALL_DIR=%~2"
-    set "SKIP_NEXT=1"
-    shift
-    shift
-    goto :parse_args
-)
 if "!TARGET!"=="latest" (
     set "TARGET=%~1"
 ) else (
     echo Unexpected argument: %~1 >&2
-    echo Usage: %0 [stable^|latest^|VERSION] [--install-dir DIR] [-d DIR] >&2
-    echo Example: %0 1.0.58 --install-dir "C:\MyTools\Claude" >&2
+    echo Usage: %0 [stable^|latest^|VERSION] >&2
     exit /b 1
 )
 shift
@@ -48,8 +26,7 @@ if /i "!TARGET!"=="latest" goto :target_valid
 echo !TARGET! | findstr /r "^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*" >nul
 if !ERRORLEVEL! equ 0 goto :target_valid
 
-echo Usage: %0 [stable^|latest^|VERSION] [--install-dir DIR] >&2
-echo Example: %0 1.0.58 --install-dir "C:\MyTools\Claude" >&2
+echo Usage: %0 [stable^|latest^|VERSION] >&2
 exit /b 1
 
 :target_valid
@@ -75,16 +52,7 @@ if /i "%PROCESSOR_ARCHITECTURE%"=="ARM64" (
     set "PLATFORM=win32-x64"
 )
 
-REM 设置安装目录
-if "!INSTALL_DIR!"=="" (
-    set "INSTALL_DIR=%USERPROFILE%\.claude"
-    echo No install directory specified, using default: !INSTALL_DIR!
-) else (
-    echo Using custom install directory: !INSTALL_DIR!
-)
-
-REM 创建安装目录和下载目录
-if not exist "!INSTALL_DIR!" mkdir "!INSTALL_DIR!"
+REM 创建下载目录
 if not exist "!DOWNLOAD_DIR!" mkdir "!DOWNLOAD_DIR!"
 
 REM Check for curl availability
@@ -147,12 +115,9 @@ if !ERRORLEVEL! neq 0 (
     exit /b 1
 )
 
-REM 设置环境变量传递给安装程序
-set "CLAUDE_INSTALL_DIR=!INSTALL_DIR!"
-
 REM Run claude install to set up launcher and shell integration
-echo Setting up Claude Code in: !INSTALL_DIR!
-"!BINARY_PATH!" install --install-dir "!INSTALL_DIR!" "!TARGET!"
+echo Setting up Claude Code...
+"!BINARY_PATH!" install "!TARGET!"
 set "INSTALL_RESULT=!ERRORLEVEL!"
 
 REM Clean up downloaded file
@@ -170,8 +135,6 @@ if !INSTALL_RESULT! neq 0 (
 
 echo.
 echo Installation complete^^!
-echo Claude Code has been installed to: !INSTALL_DIR!
-echo.
 exit /b 0
 
 REM ============================================================================
