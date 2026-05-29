@@ -35,12 +35,25 @@ log() {
 
 # URL 编码函数
 url_encode() {
-    echo -n "$1" | while IFS= read -r -n1 c; do
-        case $c in
-            [a-zA-Z0-9.~_-]) printf '%c' "$c" ;;
-            *) printf '%%%02X' "'$c" ;;
+    local string="$1"
+    local length="${#string}"
+    local encoded=""
+    local i=0
+
+    while [ "$i" -lt "$length" ]; do
+        local c="${string:$i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-])
+                encoded="$encoded$c"
+                ;;
+            *)
+                encoded="$encoded$(printf '%%%02X' "'$c")"
+                ;;
         esac
+        i=$((i + 1))
     done
+
+    echo "$encoded"
 }
 
 # 清理旧日志（每周执行一次，这里只是定义函数）
@@ -95,7 +108,7 @@ query_params="AccessKeyId=$(url_encode "$AccessKeyId")&Action=$(url_encode "Desc
 
 # 计算查询签名
 query_string_to_sign="GET&%2F&$(url_encode "$query_params")"
-query_signature=$(echo -n "$query_string_to_sign" | openssl sha1 -hmac "${AccessKeySecret}&" -binary 2>/dev/null | openssl base64 2>/dev/null | tr -d '\n')
+query_signature=$(printf '%s' "$query_string_to_sign" | openssl sha1 -hmac "${AccessKeySecret}&" -binary 2>/dev/null | openssl base64 2>/dev/null | tr -d '\n')
 encoded_query_signature=$(url_encode "$query_signature")
 
 # 调用查询API
@@ -170,7 +183,7 @@ params="AccessKeyId=$(url_encode "$AccessKeyId")&Action=$(url_encode "$action")&
 
 # 计算签名
 string_to_sign="GET&%2F&$(url_encode "$params")"
-signature=$(echo -n "$string_to_sign" | openssl sha1 -hmac "${AccessKeySecret}&" -binary 2>/dev/null | openssl base64 2>/dev/null | tr -d '\n')
+signature=$(printf '%s' "$string_to_sign" | openssl sha1 -hmac "${AccessKeySecret}&" -binary 2>/dev/null | openssl base64 2>/dev/null | tr -d '\n')
 encoded_signature=$(url_encode "$signature")
 
 # 调用API

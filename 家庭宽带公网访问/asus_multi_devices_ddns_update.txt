@@ -127,7 +127,7 @@ call_ali_api_original() {
     
     # 计算签名
     string_to_sign="GET&%2F&$(url_encode "$params")"
-    signature=$(echo -n "$string_to_sign" | openssl sha1 -hmac "${AccessKeySecret}&" -binary 2>/dev/null | openssl base64 2>/dev/null | tr -d '\n')
+    signature=$(printf '%s' "$string_to_sign" | openssl sha1 -hmac "${AccessKeySecret}&" -binary 2>/dev/null | openssl base64 2>/dev/null | tr -d '\n')
     encoded_signature=$(url_encode "$signature")
     
     # 调用API
@@ -307,7 +307,7 @@ main() {
     success_count=0
     fail_count=0
     
-    while IFS= read -r raw_line; do
+    while IFS= read -r raw_line || [ -n "$raw_line" ]; do
         # 跳过注释和空行
         [ -z "$raw_line" ] && continue
         echo "$raw_line" | grep -q '^#' && continue
