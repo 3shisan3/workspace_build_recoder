@@ -44,3 +44,7 @@ Linux：~/.claude/settings.json
   },
   "theme": "auto"
 }
+
+辅助使用模型管理工具
+https://github.com/farion1231/cc-switch
+使用文档内容有
